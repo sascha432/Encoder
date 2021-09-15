@@ -5,17 +5,17 @@
  * Version 1.2 - fix -2 bug in C-only code
  * Version 1.1 - expand to support boards with up to 60 interrupts
  * Version 1.0 - initial release
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -51,6 +51,40 @@
 #define ENCODER_ARGLIST_SIZE 0
 #endif
 
+// if set to 0, void update(PinStatesType pinStates) must be called to update the
+// state after a pin has changed
+#ifndef ENCODER_USE_DIRECT_PIN_ACCESS
+#define ENCODER_USE_DIRECT_PIN_ACCESS 1
+#endif
+
+#if ENCODER_USE_INTERRUPTS && !ENCODER_USE_DIRECT_PIN_ACCESS
+#error ENCODER_USE_INTERRUPTS requires ENCODER_USE_DIRECT_PIN_ACCESS=1
+#endif
+
+#ifndef ENCODER_USE_ATOMIC_BLOCK
+#    if ENCODER_USE_INTERRUPTS || !ENCODER_USE_DIRECT_PIN_ACCESS
+#        define ENCODER_USE_ATOMIC_BLOCK 1
+#        if defined(ESP8266) || defined(ESP32)
+//TODO
+// for eso8266 use esp8266::InterruptLock or ets_intr_lock/unlock
+// for esp32, use a semaphore mutex
+#            error not supported
+#        else
+#            include <util/atomic.h>
+#            define ENCODER_ATOMIC_BLOCK() ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+#		 endif
+#    else
+#        define ENCODER_USE_ATOMIC_BLOCK 0
+#        define ENCODER_ATOMIC_BLOCK()
+#    endif
+#endif
+
+#if defined(HAVE_UINT24) || defined(ENCODER_POSITION_DATA_TYPE)
+#    if HAVE_UINT24 != -1
+#        include <int24_types.h>
+#    endif
+#endif
+
 // Use ICACHE_RAM_ATTR for ISRs to prevent ESP8266 resets
 #if defined(ESP8266) || defined(ESP32)
 #define ENCODER_ISR_ATTR ICACHE_RAM_ATTR
@@ -59,18 +93,24 @@
 #endif
 
 
-
 // All the data needed by interrupts is consolidated into this ugly struct
 // to facilitate assembly language optimizing of the speed critical update.
 // The assembly code uses auto-incrementing addressing modes, so the struct
 // must remain in exactly this order.
 typedef struct {
+#ifdef ENCODER_POSITION_DATA_TYPE
+	using position_t = ENCODER_POSITION_DATA_TYPE;
+#else
+	using position_t = int32_t;
+#endif
+#if ENCODER_USE_DIRECT_PIN_ACCESS
 	volatile IO_REG_TYPE * pin1_register;
 	volatile IO_REG_TYPE * pin2_register;
 	IO_REG_TYPE            pin1_bitmask;
 	IO_REG_TYPE            pin2_bitmask;
+#endif
+	position_t             position;
 	uint8_t                state;
-	int32_t                position;
 } Encoder_internal_state_t;
 
 class Encoder
@@ -86,18 +126,25 @@ public:
 		pinMode(pin2, INPUT);
 		digitalWrite(pin2, HIGH);
 		#endif
+#if ENCODER_USE_DIRECT_PIN_ACCESS
 		encoder.pin1_register = PIN_TO_BASEREG(pin1);
 		encoder.pin1_bitmask = PIN_TO_BITMASK(pin1);
 		encoder.pin2_register = PIN_TO_BASEREG(pin2);
 		encoder.pin2_bitmask = PIN_TO_BITMASK(pin2);
+#endif
 		encoder.position = 0;
 		// allow time for a passive R-C filter to charge
 		// through the pullup resistors, before reading
 		// the initial state
 		delayMicroseconds(2000);
 		uint8_t s = 0;
+#if ENCODER_USE_DIRECT_PIN_ACCESS
 		if (DIRECT_PIN_READ(encoder.pin1_register, encoder.pin1_bitmask)) s |= 1;
 		if (DIRECT_PIN_READ(encoder.pin2_register, encoder.pin2_bitmask)) s |= 2;
+#else
+		if (digitalRead(pin1)) s |= 1;
+		if (digitalRead(pin2)) s |= 2;
+#endif
 		encoder.state = s;
 #ifdef ENCODER_USE_INTERRUPTS
 		interrupts_in_use = attach_interrupt(pin1, &encoder);
@@ -106,60 +153,97 @@ public:
 		//update_finishup();  // to force linker to include the code (does not work)
 	}
 
+	inline Encoder_internal_state_t::position_t read() {
+		ENCODER_ATOMIC_BLOCK() {
+			#ifdef ENCODER_USE_INTERRUPTS
+				if (interrupts_in_use < 2) {
+					update(&encoder);
+				}
+			#elif ENCODER_USE_DIRECT_PIN_ACCESS
+				update(&encoder);
+			#elif !ENCODER_USE_DIRECT_PIN_ACCESS
+				// skip update
+			#else
+				#error invalid configuration
+			#endif
+			return encoder.position;
+		}
+		__builtin_unreachable();
+	}
 
-#ifdef ENCODER_USE_INTERRUPTS
-	inline int32_t read() {
-		if (interrupts_in_use < 2) {
-			noInterrupts();
-			update(&encoder);
-		} else {
-			noInterrupts();
+	inline Encoder_internal_state_t::position_t readAndReset() {
+		ENCODER_ATOMIC_BLOCK() {
+			#ifdef ENCODER_USE_INTERRUPTS
+				if (interrupts_in_use < 2) {
+					update(&encoder);
+				}
+			#elif ENCODER_USE_DIRECT_PIN_ACCESS
+				update(&encoder);
+			#elif !ENCODER_USE_DIRECT_PIN_ACCESS
+				// skip update
+			#else
+				#error invalid configuration
+			#endif
+			auto ret = encoder.position;
+			encoder.position = 0;
+			return ret;
 		}
-		int32_t ret = encoder.position;
-		interrupts();
-		return ret;
+		__builtin_unreachable();
 	}
-	inline int32_t readAndReset() {
-		if (interrupts_in_use < 2) {
-			noInterrupts();
-			update(&encoder);
-		} else {
-			noInterrupts();
+
+	inline void write(Encoder_internal_state_t::position_t p) {
+		ENCODER_ATOMIC_BLOCK() {
+			encoder.position = p;
 		}
-		int32_t ret = encoder.position;
-		encoder.position = 0;
-		interrupts();
-		return ret;
 	}
-	inline void write(int32_t p) {
-		noInterrupts();
-		encoder.position = p;
-		interrupts();
+
+ 	// bits for the pin states
+	enum class PinStatesType : uint8_t {
+		NONE = 0,
+		P1_HIGH = _BV(2),
+		P2_HIGH = _BV(3),
+		P1_P2_HIGH = P1_HIGH | P2_HIGH
+	};
+
+	// update encoder by passing the states of the encoder pins
+	// interrupts must be locked if not called from inside ISR
+	inline void update(PinStatesType pinStates)	{
+		encoder.state = ((encoder.state & 3) | static_cast<uint8_t>(pinStates)) >> 2;
+		switch (encoder.state) {
+			case 1:
+			case 7:
+			case 8:
+			case 14:
+				encoder.position++;
+				break;
+			case 2:
+			case 4:
+			case 11:
+			case 13:
+				encoder.position--;
+				break;
+			case 3:
+			case 12:
+				encoder.position += 2;
+				break;
+			case 6:
+			case 9:
+				encoder.position -= 2;
+				break;
+		}
 	}
-#else
-	inline int32_t read() {
-		update(&encoder);
-		return encoder.position;
-	}
-	inline int32_t readAndReset() {
-		update(&encoder);
-		int32_t ret = encoder.position;
-		encoder.position = 0;
-		return ret;
-	}
-	inline void write(int32_t p) {
-		encoder.position = p;
-	}
-#endif
+
 private:
 	Encoder_internal_state_t encoder;
 #ifdef ENCODER_USE_INTERRUPTS
 	uint8_t interrupts_in_use;
 #endif
 public:
+#if ENCODER_ARGLIST_SIZE
 	static Encoder_internal_state_t * interruptArgs[ENCODER_ARGLIST_SIZE];
+#endif
 
-//                           _______         _______       
+//                           _______         _______
 //               Pin1 ______|       |_______|       |______ Pin1
 // negative <---         _______         _______         __      --> positive
 //               Pin2 __|       |_______|       |_______|   Pin2
@@ -207,6 +291,7 @@ public:
 */
 
 public:
+#if ENCODER_USE_DIRECT_PIN_ACCESS
 	// update() is not meant to be called from outside Encoder,
 	// but it is public to allow static interrupt routines.
 	// DO NOT call update() directly from sketches.
@@ -318,6 +403,8 @@ public:
 		}
 #endif
 	}
+#endif
+
 private:
 /*
 #if defined(__AVR__)
