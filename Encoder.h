@@ -39,26 +39,28 @@
 #endif
 
 #include "utility/direct_pin_read.h"
+#include<helpers.h>//TODO remove
 
 #if defined(ENCODER_USE_INTERRUPTS) || !defined(ENCODER_DO_NOT_USE_INTERRUPTS)
-#define ENCODER_USE_INTERRUPTS
-#define ENCODER_ARGLIST_SIZE CORE_NUM_INTERRUPT
-#include "utility/interrupt_pins.h"
-#ifdef ENCODER_OPTIMIZE_INTERRUPTS
-#include "utility/interrupt_config.h"
-#endif
+#    define ENCODER_USE_INTERRUPTS
+#    define ENCODER_ARGLIST_SIZE CORE_NUM_INTERRUPT
+#    include "utility/interrupt_pins.h"
+#    ifdef ENCODER_OPTIMIZE_INTERRUPTS
+#        include "utility/interrupt_config.h"
+#    endif
 #else
-#define ENCODER_ARGLIST_SIZE 0
+#    define ENCODER_ARGLIST_SIZE 0
 #endif
 
-// if set to 0, void update(PinStatesType pinStates) must be called to update the
-// state after a pin has changed
+// set to 1, void update(PinStatesType pinStates) must be called to update the state
+// after a pin has changed.
+// set to 0, the library reads the pins and updates the position automatically
 #ifndef ENCODER_USE_DIRECT_PIN_ACCESS
-#define ENCODER_USE_DIRECT_PIN_ACCESS 1
+#    define ENCODER_USE_DIRECT_PIN_ACCESS 0
 #endif
 
 #if ENCODER_USE_INTERRUPTS && !ENCODER_USE_DIRECT_PIN_ACCESS
-#error ENCODER_USE_INTERRUPTS requires ENCODER_USE_DIRECT_PIN_ACCESS=1
+#    error ENCODER_USE_INTERRUPTS requires ENCODER_USE_DIRECT_PIN_ACCESS=1
 #endif
 
 #ifndef ENCODER_USE_ATOMIC_BLOCK
@@ -67,7 +69,7 @@
 #        if defined(ESP8266) || defined(ESP32)
 //TODO
 // for eso8266 use esp8266::InterruptLock or ets_intr_lock/unlock
-// for esp32, use a semaphore mutex
+// for esp32, use a semaphore mutex or std::mutex
 #            error not supported
 #        else
 #            include <util/atomic.h>
@@ -87,70 +89,346 @@
 
 // Use ICACHE_RAM_ATTR for ISRs to prevent ESP8266 resets
 #if defined(ESP8266) || defined(ESP32)
-#define ENCODER_ISR_ATTR ICACHE_RAM_ATTR
+#    define ENCODER_ISR_ATTR ICACHE_RAM_ATTR
 #else
-#define ENCODER_ISR_ATTR
+#    define ENCODER_ISR_ATTR
 #endif
 
+// store additional debug data about acceleration
+#ifndef ENCODER_DEBUG
+#    define ENCODER_DEBUG 1
+#endif
+
+#if ENCODER_DEBUG
+	struct diff_t {
+		uint32_t millis;
+		uint16_t time;
+		uint8_t rotations;
+		uint32_t acceleration;
+		int32_t position;
+		diff_t(uint16_t _time, uint8_t _rotations = 0, uint32_t _acceleration = 0, int32_t _position = 0) :
+			millis(::millis()),
+			time(_time),
+			rotations(_rotations),
+			acceleration(_acceleration),
+			position(_position)
+		{}
+		diff_t() :
+			millis(0),
+			time(0),
+			rotations(0),
+			acceleration(0),
+			position(0)
+		{}
+	};
+#endif
 
 // All the data needed by interrupts is consolidated into this ugly struct
 // to facilitate assembly language optimizing of the speed critical update.
 // The assembly code uses auto-incrementing addressing modes, so the struct
 // must remain in exactly this order.
-typedef struct {
-#ifdef ENCODER_POSITION_DATA_TYPE
-	using position_t = ENCODER_POSITION_DATA_TYPE;
-#else
-	using position_t = int32_t;
-#endif
-#if ENCODER_USE_DIRECT_PIN_ACCESS
-	volatile IO_REG_TYPE * pin1_register;
-	volatile IO_REG_TYPE * pin2_register;
-	IO_REG_TYPE            pin1_bitmask;
-	IO_REG_TYPE            pin2_bitmask;
-#endif
-	position_t             position;
-	uint8_t                state;
-} Encoder_internal_state_t;
+struct Encoder_internal_state_t {
+	// these values give fine control in increments of one und up to 64 steps at once with full acceleration
+	// a single fast turn can change the value by more than 5000 or just increment it in single steps by turning
+	// very slowly. the acceleration is updated every single step and responds very quickly
+	//
+	// the user can set the amount of acceleration to use
+
+	// reset acceleration if more time (milliseconds) passed between moving the encoder
+	static constexpr uint32_t kResetTimeout = 2500;
+	// acceleration from 0-255 / 0-100% / basic multiplier
+	static constexpr uint8_t kDefaultAcceleration = 128;
+	// threshold before activating acceleration
+	static constexpr uint32_t kAccelerationThreshold = 300000;
+	// shift bits to the right before applying the acceleration value
+	// (value - kAccelerationThreshold) >> kAccelerationDivider
+	static constexpr uint8_t kAccelerationDivider = 12;
+	// max. multiplier per step
+	static constexpr uint8_t kAccelerationMaxMultiplier = 64;
+	// the weight of new acceleration vs stored in the integration (bit shift, 5 = multiplied by 32)
+	// this allow to configure the rate of change independently from the averaging period at no
+	// extra cost since it is done in the fixed point alogrihtm
+	static constexpr uint8_t kAccelerationWeight = 5;
+	// averaging period in milliseconds
+	// the movements are integrated into the acceleration value with a rate of 256 units
+	// per second and kAccelerationWeight. low values will cause a quick increase and decrease
+	// of the acceleration, high values will make it slower to respond
+	static constexpr uint32_t kAveragingPeriod = 50;
+	// bounce events within 10 milliseconds
+	// should be set at least to 2, even with hardware debouncing (which is highly recommended)
+	static constexpr uint32_t kDebounceTime = 10;
+	// use an average value of the last 5 acceleration values to avoid choppy input
+	// the algorithm changes the acceleration each step, but requires turning the
+	// encoder very smoothly. the averaging cancels this effect out
+	static constexpr uint8_t kAccelerationAverageCount = 5;
+
+	// debug only
+	static constexpr uint32_t kInvalidTime = 0x7fffffff;
+
+
+	#ifdef ENCODER_POSITION_DATA_TYPE
+		using position_t = ENCODER_POSITION_DATA_TYPE;
+	#else
+		using position_t = int32_t;
+	#endif
+
+	#if ENCODER_USE_DIRECT_PIN_ACCESS
+		volatile IO_REG_TYPE * pin1_register;
+		volatile IO_REG_TYPE * pin2_register;
+		IO_REG_TYPE            pin1_bitmask;
+		IO_REG_TYPE            pin2_bitmask;
+	#endif
+
+	position_t position;
+	uint32_t last;
+	uint32_t currentAcceleration;
+	uint32_t averageAcceleration;
+	#if ENCODER_DEBUG
+		uint32_t time;
+		uint16_t duration;
+		uint16_t rotations;
+		diff_t history[16];
+		void clearHistory() {
+			memset(history, 0, sizeof(history));
+		}
+		void addHistory(uint16_t diff) {
+			if (!diff) {
+				diff = ~0;
+			}
+			addHistory(diff_t(diff, rotations, currentAcceleration, position));
+		}
+		void addHistory(const diff_t &data) {
+			memmove(&history[1], &history[0], sizeof(history) - sizeof(*history));
+			history[0] = data;
+		}
+		diff_t getHistory() {
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+				auto hPtr = &history[15];
+				for(uint8_t i = 0; i < 16; i++, hPtr--) {
+					if (hPtr->time) { // find last entry and return it
+						diff_t tmp = *hPtr;
+						*hPtr = diff_t();
+						return tmp;
+					}
+				}
+			}
+			return diff_t();
+		}
+	#endif
+	uint8_t state;
+	uint8_t acceleration;
+
+	Encoder_internal_state_t() { }
+
+	Encoder_internal_state_t(uint8_t _state) :
+		position(0),
+		last(0),
+		currentAcceleration(0),
+		averageAcceleration(0),
+		#if ENCODER_DEBUG
+			time(kInvalidTime),
+			duration(0),
+			rotations(0),
+			history{},
+		#endif
+		state(_state),
+		acceleration(kDefaultAcceleration)
+	{
+	}
+
+	// restart acceleration
+	void resetDuration() {
+		last = millis();
+		currentAcceleration = 0;
+		averageAcceleration = 0;
+		#if ENCODER_DEBUG
+			duration = 0;
+			rotations = 0;
+			time = last;
+			clearHistory();
+		#endif
+	}
+
+	// update duration
+	// returns false if the event has bounced
+	bool updateDuration() {
+		uint32_t time = millis();
+		uint32_t diff = time - last;
+		if (diff > kResetTimeout) {
+			resetDuration();
+			#if ENCODER_DEBUG
+				addHistory(diff_t(diff, 0, 0, 99999));
+			#endif
+			return true;
+		}
+		if (diff < kDebounceTime) {
+			#if ENCODER_DEBUG
+				addHistory(diff_t(diff, rotations, currentAcceleration, 77777));
+			#endif
+			return false;
+		}
+		last = time;
+		#if ENCODER_DEBUG
+			if (this->time == kInvalidTime) {
+				this->time = time;
+			}
+			uint32_t tmp = time - this->time;
+			duration = (tmp < kInvalidTime) ? tmp : kInvalidTime;
+		#endif
+		auto diff2 = diff;
+		if (diff2 < kDebounceTime) {
+			diff2 = kDebounceTime;
+		}
+		// the multiplier adds existing acceleration over kAveragingPeriod
+		uint32_t multiplier = kAveragingPeriod / diff2;
+		// add 256 acceleration points per second
+		// 1000 * 256 / diff
+		uint32_t newValue = ((1000UL << (8/* 256 */ + kAccelerationWeight)) / diff2);
+		// integrate new acceleration
+		currentAcceleration = ((currentAcceleration * multiplier) + newValue) / (multiplier + 1);
+		#if ENCODER_DEBUG
+			addHistory(diff);
+		#endif
+		return true;
+	}
+
+	// add value to average and return average
+	uint32_t addToAverage(uint32_t value) {
+		averageAcceleration = ((averageAcceleration * (kAccelerationAverageCount - 1)) + value) / kAccelerationAverageCount;
+		return averageAcceleration;
+	}
+
+	int16_t getSteps(int8_t steps) {
+		auto result = _getSteps(steps);
+		#if ENCODER_DEBUG && 0
+			NONATOMIC_BLOCK(NONATOMIC_RESTORESTATE) {
+				Serial.printf_P(PSTR("%d->%d (%ld)\n"), steps, result, averageAcceleration);
+			}
+		#endif
+		return result;
+	}
+
+	// get steps with acceleration
+	int16_t _getSteps(int8_t steps)
+	{
+		if (!steps || !acceleration || currentAcceleration <= kAccelerationThreshold) {
+			addToAverage(0);
+			return steps;
+		}
+		// get up to 100% of currentAcceleration, depending on the user settings
+		auto tmp = getAcceleration(currentAcceleration - kAccelerationThreshold);
+		// multiply the acceleration factor with the steps
+		int32_t retval = steps * addToAverage(tmp);
+		retval >>= kAccelerationDivider;
+
+		int16_t limit = steps * kAccelerationMaxMultiplier;
+		if (steps < 0) {
+			// return value must be smaller or equal steps and above limit
+			if (retval <= limit) {
+				return limit;
+			}
+			if (retval < steps) {
+				return retval;
+			}
+			return steps;
+		}
+		else {
+			// return value must be greater or equal steps and below limit
+			if (retval >= limit) {
+				return limit;
+			}
+			if (retval > steps) {
+				return retval;
+			}
+			return steps;
+		}
+	}
+
+	uint32_t getAcceleration(uint32_t accelerationValue) const {
+		return ((accelerationValue) * (acceleration + 1)) >> 8;
+	}
+
+	void setAcceleration(uint8_t _acceleration) {
+		acceleration = _acceleration;
+	}
+
+	#if ENCODER_DEBUG
+		void dump(Stream &output) {
+			output.printf_P(PSTR("last=%ld ac=%ld dur=%u rot=%u spd=%u pos=%ld\n"),
+				(long)last,
+				(long)currentAcceleration,
+				duration,
+				rotations,
+				/*getSteps(1)*/0,
+				(long)position
+			);
+			output.flush();
+
+			dumpHistory(output);
+		}
+
+		void dumpHistory(Stream &output) {
+			auto h = getHistory();
+			while (h.time) {
+				char buf[32];
+				PrintBuffer pb(buf, sizeof(buf));
+				pb.print(getAcceleration(std::max<int32_t>(0, h.acceleration - kAccelerationThreshold)) / (float)(1UL << (kAccelerationWeight + kAccelerationDivider)), 2);
+				output.printf_P(PSTR("H t=%07ld T=%05u p=%05ld ai=%-11.11s"),
+					(long)h.millis,
+					(unsigned)h.time,
+					(long)h.position,
+					buf
+				);
+				output.flush();
+				output.printf_P(PSTR(" a=%ld / %ld\n"),
+					(long)getAcceleration(h.acceleration),
+					(long)h.acceleration
+				);
+				output.flush();
+				h = getHistory();
+			}
+		}
+	#endif
+
+};
 
 class Encoder
 {
 public:
 	Encoder(uint8_t pin1, uint8_t pin2) {
 		#ifdef INPUT_PULLUP
-		pinMode(pin1, INPUT_PULLUP);
-		pinMode(pin2, INPUT_PULLUP);
+			pinMode(pin1, INPUT_PULLUP);
+			pinMode(pin2, INPUT_PULLUP);
 		#else
-		pinMode(pin1, INPUT);
-		digitalWrite(pin1, HIGH);
-		pinMode(pin2, INPUT);
-		digitalWrite(pin2, HIGH);
+			pinMode(pin1, INPUT);
+			digitalWrite(pin1, HIGH);
+			pinMode(pin2, INPUT);
+			digitalWrite(pin2, HIGH);
 		#endif
-#if ENCODER_USE_DIRECT_PIN_ACCESS
-		encoder.pin1_register = PIN_TO_BASEREG(pin1);
-		encoder.pin1_bitmask = PIN_TO_BITMASK(pin1);
-		encoder.pin2_register = PIN_TO_BASEREG(pin2);
-		encoder.pin2_bitmask = PIN_TO_BITMASK(pin2);
-#endif
-		encoder.position = 0;
+		#if ENCODER_USE_DIRECT_PIN_ACCESS
+			encoder.pin1_register = PIN_TO_BASEREG(pin1);
+			encoder.pin1_bitmask = PIN_TO_BITMASK(pin1);
+			encoder.pin2_register = PIN_TO_BASEREG(pin2);
+			encoder.pin2_bitmask = PIN_TO_BITMASK(pin2);
+		#endif
 		// allow time for a passive R-C filter to charge
 		// through the pullup resistors, before reading
 		// the initial state
 		delayMicroseconds(2000);
 		uint8_t s = 0;
-#if ENCODER_USE_DIRECT_PIN_ACCESS
-		if (DIRECT_PIN_READ(encoder.pin1_register, encoder.pin1_bitmask)) s |= 1;
-		if (DIRECT_PIN_READ(encoder.pin2_register, encoder.pin2_bitmask)) s |= 2;
-#else
-		if (digitalRead(pin1)) s |= 1;
-		if (digitalRead(pin2)) s |= 2;
-#endif
-		encoder.state = s;
-#ifdef ENCODER_USE_INTERRUPTS
-		interrupts_in_use = attach_interrupt(pin1, &encoder);
-		interrupts_in_use += attach_interrupt(pin2, &encoder);
-#endif
-		//update_finishup();  // to force linker to include the code (does not work)
+		#if ENCODER_USE_DIRECT_PIN_ACCESS
+			if (DIRECT_PIN_READ(encoder.pin1_register, encoder.pin1_bitmask)) s = static_cast<uint8_t>(PinStatesType::P1_HIGH);
+			if (DIRECT_PIN_READ(encoder.pin2_register, encoder.pin2_bitmask)) s |= static_cast<uint8_t>(PinStatesType::P2_HIGH);
+		#else
+			if (digitalRead(pin1)) s = static_cast<uint8_t>(PinStatesType::P1_HIGH);
+			if (digitalRead(pin2)) s |= static_cast<uint8_t>(PinStatesType::P2_HIGH);
+		#endif
+		encoder = Encoder_internal_state_t(0);
+		__updateState(static_cast<PinStatesType>(s));
+		#ifdef ENCODER_USE_INTERRUPTS
+			interrupts_in_use = attach_interrupt(pin1, &encoder);
+			interrupts_in_use += attach_interrupt(pin2, &encoder);
+		#endif
 	}
 
 	inline Encoder_internal_state_t::position_t read() {
@@ -194,46 +472,84 @@ public:
 	inline void write(Encoder_internal_state_t::position_t p) {
 		ENCODER_ATOMIC_BLOCK() {
 			encoder.position = p;
+			encoder.resetDuration();
+		}
+	}
+
+	// same as write but does not reset the acceleration
+	inline void reset(Encoder_internal_state_t::position_t p) {
+		ENCODER_ATOMIC_BLOCK() {
+			encoder.position = p;
 		}
 	}
 
  	// bits for the pin states
 	enum class PinStatesType : uint8_t {
 		NONE = 0,
-		P1_HIGH = _BV(2),
-		P2_HIGH = _BV(3),
+		P1_HIGH = _BV(0),
+		P2_HIGH = _BV(1),
+		// P1_HIGH = _BV(2), // for old algorihtm
+		// P2_HIGH = _BV(3),
 		P1_P2_HIGH = P1_HIGH | P2_HIGH
 	};
+
+	int8_t __updateState(PinStatesType pinStates);
 
 	// update encoder by passing the states of the encoder pins
 	// interrupts must be locked if not called from inside ISR
 	inline void update(PinStatesType pinStates)	{
-		encoder.state = ((encoder.state & 3) | static_cast<uint8_t>(pinStates)) >> 2;
-		switch (encoder.state) {
-			case 1:
-			case 7:
-			case 8:
-			case 14:
-				encoder.position++;
-				break;
-			case 2:
-			case 4:
-			case 11:
-			case 13:
-				encoder.position--;
-				break;
-			case 3:
-			case 12:
-				encoder.position += 2;
-				break;
-			case 6:
-			case 9:
-				encoder.position -= 2;
-				break;
-		}
+		#if 0
+			// old algorithm that has some issues
+			int8_t steps;
+			uint8_t state = (encoder.state & 3) | static_cast<uint8_t>(pinStates);
+			encoder.state = state >> 2;
+			switch (state) {
+				case 0:
+				case 5:
+				case 10:
+				case 15:
+					return;
+				case 1:
+				case 7:
+				case 8:
+				case 14:
+					steps = 1;
+					break;
+				case 2:
+				case 4:
+				case 11:
+				case 13:
+					steps = -1;
+					break;
+				case 3:
+				case 12:
+					steps = 2;
+					break;
+				default:
+					steps = -2;
+					break;
+			}
+			if (encoder.updateDuration()) {
+				encoder.position += encoder.getSteps(steps);
+				#if ENCODER_DEBUG
+					encoder.rotations += (steps >= 0) ? steps : -steps;
+				#endif
+			}
+		#else
+			auto steps = __updateState(pinStates);
+			encoder.updateDuration();
+			if (steps) {
+				encoder.position += encoder.getSteps(steps);
+				#if ENCODER_DEBUG
+					encoder.rotations += (steps >= 0) ? steps : -steps;
+				#endif
+			}
+		#endif
 	}
 
+#if !ENCODER_DEBUG
 private:
+#endif
 	Encoder_internal_state_t encoder;
 #ifdef ENCODER_USE_INTERRUPTS
 	uint8_t interrupts_in_use;
@@ -295,176 +611,15 @@ public:
 	// update() is not meant to be called from outside Encoder,
 	// but it is public to allow static interrupt routines.
 	// DO NOT call update() directly from sketches.
-	static void update(Encoder_internal_state_t *arg) {
-#if defined(__AVR__)
-		// The compiler believes this is just 1 line of code, so
-		// it will inline this function into each interrupt
-		// handler.  That's a tiny bit faster, but grows the code.
-		// Especially when used with ENCODER_OPTIMIZE_INTERRUPTS,
-		// the inline nature allows the ISR prologue and epilogue
-		// to only save/restore necessary registers, for very nice
-		// speed increase.
-		asm volatile (
-			"ld	r30, X+"		"\n\t"
-			"ld	r31, X+"		"\n\t"
-			"ld	r24, Z"			"\n\t"	// r24 = pin1 input
-			"ld	r30, X+"		"\n\t"
-			"ld	r31, X+"		"\n\t"
-			"ld	r25, Z"			"\n\t"  // r25 = pin2 input
-			"ld	r30, X+"		"\n\t"  // r30 = pin1 mask
-			"ld	r31, X+"		"\n\t"	// r31 = pin2 mask
-			"ld	r22, X"			"\n\t"	// r22 = state
-			"andi	r22, 3"			"\n\t"
-			"and	r24, r30"		"\n\t"
-			"breq	L%=1"			"\n\t"	// if (pin1)
-			"ori	r22, 4"			"\n\t"	//	state |= 4
-		"L%=1:"	"and	r25, r31"		"\n\t"
-			"breq	L%=2"			"\n\t"	// if (pin2)
-			"ori	r22, 8"			"\n\t"	//	state |= 8
-		"L%=2:" "ldi	r30, lo8(pm(L%=table))"	"\n\t"
-			"ldi	r31, hi8(pm(L%=table))"	"\n\t"
-			"add	r30, r22"		"\n\t"
-			"adc	r31, __zero_reg__"	"\n\t"
-			"asr	r22"			"\n\t"
-			"asr	r22"			"\n\t"
-			"st	X+, r22"		"\n\t"  // store new state
-			"ld	r22, X+"		"\n\t"
-			"ld	r23, X+"		"\n\t"
-			"ld	r24, X+"		"\n\t"
-			"ld	r25, X+"		"\n\t"
-			"ijmp"				"\n\t"	// jumps to update_finishup()
-			// TODO move this table to another static function,
-			// so it doesn't get needlessly duplicated.  Easier
-			// said than done, due to linker issues and inlining
-		"L%=table:"				"\n\t"
-			"rjmp	L%=end"			"\n\t"	// 0
-			"rjmp	L%=plus1"		"\n\t"	// 1
-			"rjmp	L%=minus1"		"\n\t"	// 2
-			"rjmp	L%=plus2"		"\n\t"	// 3
-			"rjmp	L%=minus1"		"\n\t"	// 4
-			"rjmp	L%=end"			"\n\t"	// 5
-			"rjmp	L%=minus2"		"\n\t"	// 6
-			"rjmp	L%=plus1"		"\n\t"	// 7
-			"rjmp	L%=plus1"		"\n\t"	// 8
-			"rjmp	L%=minus2"		"\n\t"	// 9
-			"rjmp	L%=end"			"\n\t"	// 10
-			"rjmp	L%=minus1"		"\n\t"	// 11
-			"rjmp	L%=plus2"		"\n\t"	// 12
-			"rjmp	L%=minus1"		"\n\t"	// 13
-			"rjmp	L%=plus1"		"\n\t"	// 14
-			"rjmp	L%=end"			"\n\t"	// 15
-		"L%=minus2:"				"\n\t"
-			"subi	r22, 2"			"\n\t"
-			"sbci	r23, 0"			"\n\t"
-			"sbci	r24, 0"			"\n\t"
-			"sbci	r25, 0"			"\n\t"
-			"rjmp	L%=store"		"\n\t"
-		"L%=minus1:"				"\n\t"
-			"subi	r22, 1"			"\n\t"
-			"sbci	r23, 0"			"\n\t"
-			"sbci	r24, 0"			"\n\t"
-			"sbci	r25, 0"			"\n\t"
-			"rjmp	L%=store"		"\n\t"
-		"L%=plus2:"				"\n\t"
-			"subi	r22, 254"		"\n\t"
-			"rjmp	L%=z"			"\n\t"
-		"L%=plus1:"				"\n\t"
-			"subi	r22, 255"		"\n\t"
-		"L%=z:"	"sbci	r23, 255"		"\n\t"
-			"sbci	r24, 255"		"\n\t"
-			"sbci	r25, 255"		"\n\t"
-		"L%=store:"				"\n\t"
-			"st	-X, r25"		"\n\t"
-			"st	-X, r24"		"\n\t"
-			"st	-X, r23"		"\n\t"
-			"st	-X, r22"		"\n\t"
-		"L%=end:"				"\n"
-		: : "x" (arg) : "r22", "r23", "r24", "r25", "r30", "r31");
-#else
-		uint8_t p1val = DIRECT_PIN_READ(arg->pin1_register, arg->pin1_bitmask);
-		uint8_t p2val = DIRECT_PIN_READ(arg->pin2_register, arg->pin2_bitmask);
-		uint8_t state = arg->state & 3;
-		if (p1val) state |= 4;
-		if (p2val) state |= 8;
-		arg->state = (state >> 2);
-		switch (state) {
-			case 1: case 7: case 8: case 14:
-				arg->position++;
-				return;
-			case 2: case 4: case 11: case 13:
-				arg->position--;
-				return;
-			case 3: case 12:
-				arg->position += 2;
-				return;
-			case 6: case 9:
-				arg->position -= 2;
-				return;
+	static void ENCODER_ISR_ATTR update(Encoder_internal_state_t *arg) {
+		// read pins and pass value to update method
+		PinStatesType val = DIRECT_PIN_READ(arg->pin1_register, arg->pin1_bitmask) ? PinStatesType::P1_HIGH : PinStatesType::NONE;
+		if (DIRECT_PIN_READ(arg->pin2_register, arg->pin2_bitmask)) {
+			val = static_cast<PinStatesType>(static_cast<uint8_t>(val) | static_cast<uint8_t>(PinStatesType::P2_HIGH));
 		}
-#endif
+		update(val);
 	}
 #endif
-
-private:
-/*
-#if defined(__AVR__)
-	// TODO: this must be a no inline function
-	// even noinline does not seem to solve difficult
-	// problems with this.  Oh well, it was only meant
-	// to shrink code size - there's no performance
-	// improvement in this, only code size reduction.
-	__attribute__((noinline)) void update_finishup(void) {
-		asm volatile (
-			"ldi	r30, lo8(pm(Ltable))"	"\n\t"
-			"ldi	r31, hi8(pm(Ltable))"	"\n\t"
-		"Ltable:"				"\n\t"
-			"rjmp	L%=end"			"\n\t"	// 0
-			"rjmp	L%=plus1"		"\n\t"	// 1
-			"rjmp	L%=minus1"		"\n\t"	// 2
-			"rjmp	L%=plus2"		"\n\t"	// 3
-			"rjmp	L%=minus1"		"\n\t"	// 4
-			"rjmp	L%=end"			"\n\t"	// 5
-			"rjmp	L%=minus2"		"\n\t"	// 6
-			"rjmp	L%=plus1"		"\n\t"	// 7
-			"rjmp	L%=plus1"		"\n\t"	// 8
-			"rjmp	L%=minus2"		"\n\t"	// 9
-			"rjmp	L%=end"			"\n\t"	// 10
-			"rjmp	L%=minus1"		"\n\t"	// 11
-			"rjmp	L%=plus2"		"\n\t"	// 12
-			"rjmp	L%=minus1"		"\n\t"	// 13
-			"rjmp	L%=plus1"		"\n\t"	// 14
-			"rjmp	L%=end"			"\n\t"	// 15
-		"L%=minus2:"				"\n\t"
-			"subi	r22, 2"			"\n\t"
-			"sbci	r23, 0"			"\n\t"
-			"sbci	r24, 0"			"\n\t"
-			"sbci	r25, 0"			"\n\t"
-			"rjmp	L%=store"		"\n\t"
-		"L%=minus1:"				"\n\t"
-			"subi	r22, 1"			"\n\t"
-			"sbci	r23, 0"			"\n\t"
-			"sbci	r24, 0"			"\n\t"
-			"sbci	r25, 0"			"\n\t"
-			"rjmp	L%=store"		"\n\t"
-		"L%=plus2:"				"\n\t"
-			"subi	r22, 254"		"\n\t"
-			"rjmp	L%=z"			"\n\t"
-		"L%=plus1:"				"\n\t"
-			"subi	r22, 255"		"\n\t"
-		"L%=z:"	"sbci	r23, 255"		"\n\t"
-			"sbci	r24, 255"		"\n\t"
-			"sbci	r25, 255"		"\n\t"
-		"L%=store:"				"\n\t"
-			"st	-X, r25"		"\n\t"
-			"st	-X, r24"		"\n\t"
-			"st	-X, r23"		"\n\t"
-			"st	-X, r22"		"\n\t"
-		"L%=end:"				"\n"
-		: : : "r22", "r23", "r24", "r25", "r30", "r31");
-	}
-#endif
-*/
-
 
 #ifdef ENCODER_USE_INTERRUPTS
 	// this giant function is an unfortunate consequence of Arduino's
@@ -1059,5 +1214,154 @@ ISR(INT7_vect) { Encoder::update(Encoder::interruptArgs[SCRAMBLE_INT_ORDER(7)]);
 #endif
 #endif // ENCODER_OPTIMIZE_INTERRUPTS
 
+
+
+// https://github.com/buxtronix/arduino/blob/master/libraries/Rotary/Rotary.cpp
+
+/* Rotary encoder handler for arduino. v1.1
+ *
+ * Copyright 2011 Ben Buxton. Licenced under the GNU GPL Version 3.
+ * Contact: bb@cactii.net
+ *
+ * A typical mechanical rotary encoder emits a two bit gray code
+ * on 3 output pins. Every step in the output (often accompanied
+ * by a physical 'click') generates a specific sequence of output
+ * codes on the pins.
+ *
+ * There are 3 pins used for the rotary encoding - one common and
+ * two 'bit' pins.
+ *
+ * The following is the typical sequence of code on the output when
+ * moving from one step to the next:
+ *
+ *   Position   Bit1   Bit2
+ *   ----------------------
+ *     Step1     0      0
+ *      1/4      1      0
+ *      1/2      1      1
+ *      3/4      0      1
+ *     Step2     0      0
+ *
+ * From this table, we can see that when moving from one 'click' to
+ * the next, there are 4 changes in the output code.
+ *
+ * - From an initial 0 - 0, Bit1 goes high, Bit0 stays low.
+ * - Then both bits are high, halfway through the step.
+ * - Then Bit1 goes low, but Bit2 stays high.
+ * - Finally at the end of the step, both bits return to 0.
+ *
+ * Detecting the direction is easy - the table simply goes in the other
+ * direction (read up instead of down).
+ *
+ * To decode this, we use a simple state machine. Every time the output
+ * code changes, it follows state, until finally a full steps worth of
+ * code is received (in the correct order). At the final 0-0, it returns
+ * a value indicating a step in one direction or the other.
+ *
+ * It's also possible to use 'half-step' mode. This just emits an event
+ * at both the 0-0 and 1-1 positions. This might be useful for some
+ * encoders where you want to detect all positions.
+ *
+ * If an invalid state happens (for example we go from '0-1' straight
+ * to '1-0'), the state machine resets to the start until 0-0 and the
+ * next valid codes occur.
+ *
+ * The biggest advantage of using a state machine over other algorithms
+ * is that this has inherent debounce built in. Other algorithms emit spurious
+ * output with switch bounce, but this one will simply flip between
+ * sub-states until the bounce settles, then continue along the state
+ * machine.
+ * A side effect of debounce is that fast rotations can cause steps to
+ * be skipped. By not requiring debounce, fast rotations can be accurately
+ * measured.
+ * Another advantage is the ability to properly handle bad state, such
+ * as due to EMI, etc.
+ * It is also a lot simpler than others - a static state table and less
+ * than 10 lines of logic.
+ */
+
+// #include "Arduino.h"
+// #include "Rotary.h"
+
+/*
+ * The below state table has, for each state (row), the new state
+ * to set based on the next encoder output. From left to right in,
+ * the table, the encoder outputs are 00, 01, 10, 11, and the value
+ * in that position is the new state to set.
+ */
+
+#define R_START 0x0
+
+	// Values returned by 'process'
+// No complete step yet.
+#define DIR_NONE 0x0
+// Clockwise step.
+#define DIR_CW 0x10
+// Anti-clockwise step.
+#define DIR_CCW 0x20
+
+//#define HALF_STEP
+
+#ifdef HALF_STEP
+// Use the half-step state table (emits a code at 00 and 11)
+#define R_CCW_BEGIN 0x1
+#define R_CW_BEGIN 0x2
+#define R_START_M 0x3
+#define R_CW_BEGIN_M 0x4
+#define R_CCW_BEGIN_M 0x5
+constexpr uint8_t ttable[6][4] PROGMEM = {
+  // R_START (00)
+  {R_START_M,            R_CW_BEGIN,     R_CCW_BEGIN,  R_START},
+  // R_CCW_BEGIN
+  {R_START_M | DIR_CCW, R_START,        R_CCW_BEGIN,  R_START},
+  // R_CW_BEGIN
+  {R_START_M | DIR_CW,  R_CW_BEGIN,     R_START,      R_START},
+  // R_START_M (11)
+  {R_START_M,            R_CCW_BEGIN_M,  R_CW_BEGIN_M, R_START},
+  // R_CW_BEGIN_M
+  {R_START_M,            R_START_M,      R_CW_BEGIN_M, R_START | DIR_CW},
+  // R_CCW_BEGIN_M
+  {R_START_M,            R_CCW_BEGIN_M,  R_START_M,    R_START | DIR_CCW},
+};
+#else
+// Use the full-step state table (emits a code at 00 only)
+#define R_CW_FINAL 0x1
+#define R_CW_BEGIN 0x2
+#define R_CW_NEXT 0x3
+#define R_CCW_BEGIN 0x4
+#define R_CCW_FINAL 0x5
+#define R_CCW_NEXT 0x6
+
+const uint8_t ttable_P[7][4] PROGMEM  = {
+  // R_START
+  {R_START,    R_CW_BEGIN,  R_CCW_BEGIN, R_START},
+  // R_CW_FINAL
+  {R_CW_NEXT,  R_START,     R_CW_FINAL,  R_START | DIR_CW},
+  // R_CW_BEGIN
+  {R_CW_NEXT,  R_CW_BEGIN,  R_START,     R_START},
+  // R_CW_NEXT
+  {R_CW_NEXT,  R_CW_BEGIN,  R_CW_FINAL,  R_START},
+  // R_CCW_BEGIN
+  {R_CCW_NEXT, R_START,     R_CCW_BEGIN, R_START},
+  // R_CCW_FINAL
+  {R_CCW_NEXT, R_CCW_FINAL, R_START,     R_START | DIR_CCW},
+  // R_CCW_NEXT
+  {R_CCW_NEXT, R_CCW_FINAL, R_CCW_BEGIN, R_START},
+};
+#endif
+
+inline int8_t Encoder::__updateState(PinStatesType pinStates)
+{
+	auto value = static_cast<uint8_t>(pinStates);
+	// reads ttable_P[_state & 0xf][value]
+	encoder.state = pgm_read_byte(reinterpret_cast<const uint8_t *>(ttable_P) + (((encoder.state & 0xf) * 4) + value));
+	switch(encoder.state) {
+		case DIR_CW:
+			return 1;
+		case DIR_CCW:
+			return -1;
+	}
+	return 0;
+}
 
 #endif
